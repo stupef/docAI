@@ -149,3 +149,11 @@ springdoc:
     path: /api-docs
   swagger-ui:
     path: /swagger-ui.html
+
+# RAG 检索配置（BM25 中文分词开关 + 召回深度）
+rag:
+  bm25:
+    enabled: true
+    segment-cjk: true
+  recall:
+    depth: 50

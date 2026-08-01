@@ -3,6 +3,7 @@ package com.javaee.aiservice.rag;
 import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.data.redis.core.ScanOptions;
 import org.springframework.data.redis.core.RedisTemplate;
 import org.springframework.stereotype.Component;
@@ -34,6 +35,18 @@ public class KnowledgeBase {
 
     @Autowired
     private DocumentSegmenter documentSegmenter;
+
+    @Autowired
+    private TextTokenizer textTokenizer;
+
+    @Value("${rag.bm25.enabled:true}")
+    private boolean bm25Enabled;
+
+    // 双路召回深度（向量 + BM25 各召回这么多候选做 RRF 融合）。默认 50 覆盖中小语料全量，
+    // 保证向量漏召（排在 recallDepth 之外）的相关文档也能被 BM25 经融合推回 top-K。
+    // 语料增大时可下调以控延迟；增大到超过语料量无额外收益。
+    @Value("${rag.recall.depth:50}")
+    private int recallDepth;
 
     public void addDocument(String documentId, String content, Map<String, Object> metadata) {
         addDocumentWithSegment(documentId, content, metadata, DocumentSegmenter.StrategyType.AUTO);
@@ -237,41 +250,57 @@ public class KnowledgeBase {
         log.info("混合检索: query={}, topK={}, strategy={}", query, topK, strategyType);
 
         try {
+            // 两路召回深度必须相等：RRF 融合分 = 1/(60+rank)，若一路召回浅、一路召回深，
+            // 浅的那路在融合里天然吃亏、召回扩展被压制。recallDepth 来自配置 rag.recall.depth（默认 50），
+            // 覆盖全量候选，BM25 才能把向量漏召（排在 recallDepth 之外）的文档经融合推回 top-K。
             float[] queryVector = vectorizer.vectorize(query);
-            List<Map<String, Object>> vectorResults = vectorStore.search(queryVector, topK * 3, filters);
+            List<Map<String, Object>> vectorResults = vectorStore.search(queryVector, recallDepth, filters);
 
-            List<Map<String, Object>> bm25Results = bm25Search(query, topK * 3, filters);
+            List<Map<String, Object>> bm25Results = bm25Search(query, recallDepth, filters);
 
-            Set<String> seenIds = new HashSet<>();
-            List<Map<String, Object>> combinedResults = new ArrayList<>();
+            // RRF(Reciprocal Rank Fusion) 融合：两路各自按自身分数降序排名，
+            // 每篇文档融合分 = Σ 1/(k + rank)，k=60。这样在某一路排名高、另一路未召回的
+            // 文档也能浮到前列，BM25 真正参与混合检索（而非被追加到末尾后被截断丢弃）。
+            // 不依赖向量余弦与 BM25 分数的量纲对齐，鲁棒。
+            Map<String, Double> rrfScores = new HashMap<>();
+            Map<String, Map<String, Object>> resultById = new LinkedHashMap<>();
+            final int rrfK = 60;
 
-            for (Map<String, Object> result : vectorResults) {
-                String id = (String) result.get("id");
-                if (!seenIds.contains(id)) {
-                    seenIds.add(id);
+            for (int i = 0; i < vectorResults.size(); i++) {
+                Map<String, Object> r = vectorResults.get(i);
+                String id = (String) r.get("id");
+                rrfScores.merge(id, 1.0 / (rrfK + i + 1), Double::sum);
+                r.put("source", "vector");
+                if (!resultById.containsKey(id)) {
                     String content = getSegmentContent(id);
                     if (content == null) {
                         content = getDocumentContent(id);
                     }
-                    result.put("content", content);
-                    result.put("source", "vector");
-                    combinedResults.add(result);
+                    r.put("content", content);
+                    resultById.put(id, r);
                 }
             }
 
-            for (Map<String, Object> result : bm25Results) {
-                String id = (String) result.get("id");
-                if (!seenIds.contains(id)) {
-                    seenIds.add(id);
+            for (int i = 0; i < bm25Results.size(); i++) {
+                Map<String, Object> r = bm25Results.get(i);
+                String id = (String) r.get("id");
+                rrfScores.merge(id, 1.0 / (rrfK + i + 1), Double::sum);
+                r.put("source", "bm25");
+                if (!resultById.containsKey(id)) {
                     String content = getSegmentContent(id);
                     if (content == null) {
                         content = getDocumentContent(id);
                     }
-                    result.put("content", content);
-                    result.put("source", "bm25");
-                    combinedResults.add(result);
+                    r.put("content", content);
+                    resultById.put(id, r);
                 }
             }
+
+            List<Map<String, Object>> combinedResults = new ArrayList<>(resultById.values());
+            combinedResults.sort((a, b) -> Double.compare(
+                    rrfScores.getOrDefault(b.get("id"), 0.0),
+                    rrfScores.getOrDefault(a.get("id"), 0.0)
+            ));
 
             return combinedResults.subList(0, Math.min(topK, combinedResults.size()));
 
@@ -295,7 +324,7 @@ public class KnowledgeBase {
                 query, topK, strategyType, rerankStrategy);
 
         try {
-            List<Map<String, Object>> candidates = hybridSearch(query, topK * 3, strategyType, filters);
+            List<Map<String, Object>> candidates = hybridSearch(query, recallDepth, strategyType, filters);
 
             List<Map<String, Object>> results = reranker.rerank(query, candidates, rerankStrategy, topK);
 
@@ -323,78 +352,115 @@ public class KnowledgeBase {
 
     private List<Map<String, Object>> bm25Search(String query, int topK, Map<String, Object> filters) {
         List<Map<String, Object>> results = new ArrayList<>();
-        List<String> contentKeys = scanKeys(CONTENT_PREFIX + "*", 1000);
+        if (!bm25Enabled) {
+            return results;
+        }
+
+        // 只扫描 segment（chunk）级 key —— 与向量路返回的 chunk 级 id 对齐，
+        // 让 BM25 与向量在同一 id 空间做 RRF 融合；不再混入 document 级 id 造成评测 null。
         List<String> segmentKeys = scanKeys(SEGMENT_PREFIX + "*", 1000);
 
         Set<String> allKeys = new LinkedHashSet<>();
-        if (contentKeys != null) allKeys.addAll(contentKeys);
         if (segmentKeys != null) allKeys.addAll(segmentKeys);
 
         if (allKeys.isEmpty()) {
             return results;
         }
 
+        // 1) 收集候选 chunk 并统一分词（与 Reranker 共用 TextTokenizer，BM25 查询期现切，无需 reindex）
+        List<Bm25Doc> docs = new ArrayList<>();
         for (String key : allKeys) {
-            String docId = key.substring(key.lastIndexOf(":") + 1);
-            Map<String, Object> metadata = key.startsWith(SEGMENT_PREFIX)
-                    ? vectorStoreMetadata(docId)
-                    : getDocumentMetadata(docId);
+            String chunkId = key.substring(key.lastIndexOf(":") + 1);
+            Map<String, Object> metadata = vectorStoreMetadata(chunkId);
             if (!matchesFilters(metadata, filters)) {
                 continue;
             }
             String content = (String) redisTemplate.opsForValue().get(key);
-
-            if (content != null) {
-                float score = computeBM25(query, content);
-                if (score > 0) {
-                    results.add(Map.of(
-                        "id", docId,
-                        "similarity", score
-                    ));
-                }
+            if (content == null) {
+                continue;
+            }
+            List<String> tokens = textTokenizer.tokenize(content);
+            if (!tokens.isEmpty()) {
+                // 从分段元数据取所属文档 id（chunk 级 id 有多后缀，不靠截取，直接读 metadata 最稳）
+                Object docIdObj = metadata.get("documentId");
+                String documentId = docIdObj != null ? docIdObj.toString() : chunkId;
+                docs.add(new Bm25Doc(chunkId, documentId, tokens));
             }
         }
 
-        results.sort((a, b) -> Float.compare(
-            ((Number) b.get("similarity")).floatValue(),
-            ((Number) a.get("similarity")).floatValue()
+        if (docs.isEmpty()) {
+            return results;
+        }
+
+        // 2) 统计文档频率 DF 与平均文档长度（在扫描到的语料内计算真实 IDF）
+        Map<String, Integer> df = new HashMap<>();
+        int totalLength = 0;
+        for (Bm25Doc doc : docs) {
+            totalLength += doc.tokens.size();
+            for (String term : new HashSet<>(doc.tokens)) {
+                df.merge(term, 1, Integer::sum);
+            }
+        }
+        int N = docs.size();
+        float avgdl = (float) totalLength / N;
+
+        // 3) 对 query 分词并做标准 BM25 打分（词频 TF + 逆文档频率 IDF）
+        List<String> queryTokens = textTokenizer.tokenize(query);
+        if (queryTokens.isEmpty()) {
+            return results;
+        }
+
+        float k = 2.2f;
+        float b = 0.75f;
+        for (Bm25Doc doc : docs) {
+            float score = 0.0f;
+            Map<String, Integer> tfMap = termFreq(doc.tokens);
+            int docLen = doc.tokens.size();
+            for (String qt : queryTokens) {
+                Integer tf = tfMap.get(qt);
+                if (tf == null || tf == 0) {
+                    continue;
+                }
+                int n = df.getOrDefault(qt, 0);
+                float idf = (float) Math.log((N - n + 0.5) / (n + 0.5) + 1.0);
+                float tfNorm = (tf * (k + 1)) / (tf + k * (1 - b + b * docLen / avgdl));
+                score += idf * tfNorm;
+            }
+            if (score > 0) {
+                Map<String, Object> hit = new HashMap<>();
+                hit.put("id", doc.chunkId);            // chunk 级 id，与向量对齐
+                hit.put("documentId", doc.documentId); // 所属文档 id，评测取此字段
+                hit.put("similarity", score);
+                results.add(hit);
+            }
+        }
+
+        results.sort((o1, o2) -> Float.compare(
+            ((Number) o2.get("similarity")).floatValue(),
+            ((Number) o1.get("similarity")).floatValue()
         ));
 
         return results.subList(0, Math.min(topK, results.size()));
     }
 
-    private float computeBM25(String query, String document) {
-        if (query == null || document == null) {
-            return 0.0f;
+    private static final class Bm25Doc {
+        final String chunkId;
+        final String documentId;
+        final List<String> tokens;
+
+        Bm25Doc(String chunkId, String documentId, List<String> tokens) {
+            this.chunkId = chunkId;
+            this.documentId = documentId;
+            this.tokens = tokens;
         }
+    }
 
-        String[] queryTerms = query.toLowerCase().split("\\s+");
-        String[] docTerms = document.toLowerCase().split("\\s+");
-
-        int docLength = docTerms.length;
-        if (docLength == 0) {
-            return 0.0f;
+    private static Map<String, Integer> termFreq(List<String> tokens) {
+        Map<String, Integer> tf = new HashMap<>();
+        for (String t : tokens) {
+            tf.merge(t, 1, Integer::sum);
         }
-
-        float score = 0.0f;
-        for (String term : queryTerms) {
-            if (term.isEmpty()) continue;
-
-            int termFreq = 0;
-            for (String docTerm : docTerms) {
-                if (docTerm.contains(term) || term.contains(docTerm)) {
-                    termFreq++;
-                }
-            }
-
-            if (termFreq > 0) {
-                float tf = (float) termFreq / docLength;
-                float bm25 = (float)(tf * (2.2 + 1) / (tf + 2.2));
-                score += bm25;
-            }
-        }
-
-        return score / queryTerms.length;
+        return tf;
     }
 
     public List<String> getAllDocumentIds() {

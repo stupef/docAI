@@ -29,7 +29,7 @@ public class DocumentVectorizer {
     @Value("${spring.ai.dashscope.embedding.model:text-embedding-v4}")
     private String model;
 
-    @Value("${spring.ai.dashscope.embedding.dimension:1024}")
+    @Value("${spring.ai.dashscope.embedding.dimension:1536}")
     private int dimension;
 
     /**
@@ -52,10 +52,8 @@ public class DocumentVectorizer {
             TextEmbedding textEmbedding = new TextEmbedding();
             TextEmbeddingResult result = textEmbedding.call(param);
 
-            // 输出结果
-            System.out.println("========== Embedding响应内容开始 ==========");
-            System.out.println(result);
-            System.out.println("========== Embedding响应内容结束 ==========");
+            // 输出结果（改为 debug 日志，避免刷屏并防止泄露向量内容）
+            log.debug("Embedding API 调用完成");
 
             // 解析结果
             if (result != null && result.getOutput() != null 
@@ -68,7 +66,7 @@ public class DocumentVectorizer {
                     embedding[i] = embeddingList.get(i).floatValue();
                 }
                 
-                System.out.println("解析到向量维度: " + embedding.length);
+                log.debug("解析到向量维度={}", embedding.length);
                 return embedding;
             }
 

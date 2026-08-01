@@ -6,6 +6,7 @@ import org.slf4j.Logger;
 import org.slf4j.LoggerFactory;
 import org.springframework.beans.factory.annotation.Value;
 import org.springframework.stereotype.Component;
+import org.springframework.beans.factory.annotation.Autowired;
 
 import java.net.URI;
 import java.net.http.HttpClient;
@@ -43,6 +44,9 @@ public class Reranker {
     private final HttpClient httpClient = HttpClient.newBuilder()
             .connectTimeout(Duration.ofSeconds(5))
             .build();
+
+    @Autowired
+    private TextTokenizer textTokenizer;
 
     /**
      * 重排序策略枚举
@@ -163,30 +167,30 @@ public class Reranker {
     }
 
     /**
-     * 计算BM25分数（简化实现）
+     * 计算BM25分数（与 KnowledgeBase 共用 TextTokenizer，中文按词切分）
      */
     private float computeBM25(String query, String document) {
         if (query == null || document == null) {
             return 0.0f;
         }
 
-        String[] queryTerms = tokenize(query.toLowerCase());
-        String[] docTerms = tokenize(document.toLowerCase());
+        List<String> queryTerms = textTokenizer.tokenize(query.toLowerCase());
+        List<String> docTerms = textTokenizer.tokenize(document.toLowerCase());
 
-        int docLength = docTerms.length;
-        if (docLength == 0 || queryTerms.length == 0) {
+        int docLength = docTerms.size();
+        if (docLength == 0 || queryTerms.isEmpty()) {
             return 0.0f;
         }
 
         float score = 0.0f;
         int totalDocs = 1000; // 假设总文档数
-        
+
         for (String term : queryTerms) {
             if (term.isEmpty()) continue;
-            
+
             int termFreq = 0;
             for (String docTerm : docTerms) {
-                if (docTerm.contains(term) || term.contains(docTerm)) {
+                if (docTerm.equals(term)) {
                     termFreq++;
                 }
             }
@@ -200,7 +204,7 @@ public class Reranker {
         }
 
         // 归一化到[0,1]
-        return Math.min(1.0f, score / queryTerms.length);
+        return Math.min(1.0f, score / queryTerms.size());
     }
 
     private CrossEncoderScores computeCrossEncoderScores(String query, List<Map<String, Object>> candidates) {
@@ -296,8 +300,8 @@ public class Reranker {
         String docLower = document.toLowerCase();
 
         int matchCount = 0;
-        String[] queryTerms = tokenize(queryLower);
-        if (queryTerms.length == 0) {
+        List<String> queryTerms = textTokenizer.tokenize(queryLower);
+        if (queryTerms.isEmpty()) {
             return 0.0f;
         }
         
@@ -316,7 +320,7 @@ public class Reranker {
             }
         }
 
-        float baseScore = (float) matchCount / queryTerms.length;
+        float baseScore = (float) matchCount / queryTerms.size();
         return clamp(baseScore + positionBonus);
     }
 
@@ -369,18 +373,8 @@ public class Reranker {
         return Math.max(0.0f, Math.min(1.0f, score));
     }
 
-    private String[] tokenize(String value) {
-        String normalized = value == null ? "" : value.trim();
-        if (normalized.isEmpty()) {
-            return new String[0];
-        }
-        if (normalized.contains(" ")) {
-            return normalized.split("\\s+");
-        }
-        return normalized.codePoints()
-                .mapToObj(cp -> new String(Character.toChars(cp)))
-                .toArray(String[]::new);
-    }
+    // 中文/英文分词统一委托给 TextTokenizer（com.javaee.aiservice.rag.TextTokenizer），
+    // 保证与 KnowledgeBase 的 BM25 用词一致；原私有 tokenize 方法已移除。
 
     /**
      * 获取所有支持的重排序策略

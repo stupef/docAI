@@ -123,6 +123,13 @@
             <version>1.1.2</version>
         </dependency>
 
+        <!-- 中文分词（jieba 的 Java 移植版，用于 BM25 词粒度检索） -->
+        <dependency>
+            <groupId>com.huaban</groupId>
+            <artifactId>jieba-analysis</artifactId>
+            <version>1.0.2</version>
+        </dependency>
+
         <!-- Spring Boot Test -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
