@@ -72,17 +72,21 @@ public class KnowledgeBase {
             if (segments.isEmpty()) {
                 log.warn("文档分段结果为空，直接存储完整文档");
                 float[] vector = vectorizer.vectorize(content);
-                vectorStore.store(documentId, vector, docMetadata);
+                vectorStore.store(documentId, vector, content, docMetadata);
                 return;
             }
 
             List<String> segmentIds = new ArrayList<>();
-            for (SegmentStrategy.Segment segment : segments) {
+            // D3: 一次性批量向量化所有分段（1 次 HTTP 取代逐段 N 次 API）
+            String[] segmentTexts = new String[segments.size()];
+            for (int i = 0; i < segments.size(); i++) {
+                segmentTexts[i] = segments.get(i).getContent();
+            }
+            float[][] segmentVectors = vectorizer.vectorizeBatch(segmentTexts);
+            for (int i = 0; i < segments.size(); i++) {
+                SegmentStrategy.Segment segment = segments.get(i);
                 String segmentId = segment.getSegmentId();
                 segmentIds.add(segmentId);
-
-                String segmentContentKey = SEGMENT_PREFIX + segmentId;
-                redisTemplate.opsForValue().set(segmentContentKey, segment.getContent());
 
                 Map<String, Object> segmentMetadata = new HashMap<>(docMetadata);
                 segmentMetadata.put("documentId", documentId);
@@ -90,8 +94,9 @@ public class KnowledgeBase {
                 segmentMetadata.put("segmentTitle", segment.getTitle());
                 segmentMetadata.put("charCount", segment.getCharCount());
 
-                float[] vector = vectorizer.vectorize(segment.getContent());
-                vectorStore.store(segmentId, vector, segmentMetadata);
+                float[] vector = segmentVectors[i];
+                // 原文随向量一并交给存储实现：Qdrant 写 payload、Redis 写 segment:（彻底去掉此处直接写 Redis）
+                vectorStore.store(segmentId, vector, segment.getContent(), segmentMetadata);
             }
 
             redisTemplate.opsForValue().set(DOC_SEGMENTS_PREFIX + documentId, segmentIds);
@@ -141,7 +146,7 @@ public class KnowledgeBase {
 
     public String getSegmentContent(String segmentId) {
         try {
-            return (String) redisTemplate.opsForValue().get(SEGMENT_PREFIX + segmentId);
+            return vectorStore.getContent(segmentId);
         } catch (Exception e) {
             log.warn("获取分段内容失败", e);
             return null;
@@ -356,27 +361,23 @@ public class KnowledgeBase {
             return results;
         }
 
-        // 只扫描 segment（chunk）级 key —— 与向量路返回的 chunk 级 id 对齐，
-        // 让 BM25 与向量在同一 id 空间做 RRF 融合；不再混入 document 级 id 造成评测 null。
-        List<String> segmentKeys = scanKeys(SEGMENT_PREFIX + "*", 1000);
-
-        Set<String> allKeys = new LinkedHashSet<>();
-        if (segmentKeys != null) allKeys.addAll(segmentKeys);
-
-        if (allKeys.isEmpty()) {
+        // 1) 一次性从向量存储（Qdrant/Redis，由 backend 决定）拉全库 chunk 的原文 + 元数据，
+        //    与向量路在同一 id 空间做 RRF 融合；多租户过滤下推到存储层，BM25 不再扫 Redis segment:。
+        Map<String, Map<String, Object>> chunkMap = vectorStore.scanChunks(filters);
+        if (chunkMap.isEmpty()) {
             return results;
         }
 
-        // 1) 收集候选 chunk 并统一分词（与 Reranker 共用 TextTokenizer，BM25 查询期现切，无需 reindex）
         List<Bm25Doc> docs = new ArrayList<>();
-        for (String key : allKeys) {
-            String chunkId = key.substring(key.lastIndexOf(":") + 1);
-            Map<String, Object> metadata = vectorStoreMetadata(chunkId);
+        for (Map.Entry<String, Map<String, Object>> entry : chunkMap.entrySet()) {
+            String chunkId = entry.getKey();
+            Map<String, Object> metadata = entry.getValue();
             if (!matchesFilters(metadata, filters)) {
                 continue;
             }
-            String content = (String) redisTemplate.opsForValue().get(key);
-            if (content == null) {
+            Object contentObj = metadata.get("content");
+            String content = contentObj == null ? null : contentObj.toString();
+            if (content == null || content.isBlank()) {
                 continue;
             }
             List<String> tokens = textTokenizer.tokenize(content);
@@ -565,16 +566,4 @@ public class KnowledgeBase {
         return true;
     }
 
-    private Map<String, Object> vectorStoreMetadata(String id) {
-        try {
-            Map<Object, Object> hash = redisTemplate.opsForHash().entries("metadata:" + id);
-            Map<String, Object> metadata = new HashMap<>();
-            for (Map.Entry<Object, Object> entry : hash.entrySet()) {
-                metadata.put(entry.getKey().toString(), entry.getValue());
-            }
-            return metadata;
-        } catch (Exception e) {
-            return Collections.emptyMap();
-        }
-    }
 }

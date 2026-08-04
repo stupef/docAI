@@ -134,25 +134,36 @@ public class SemanticSegmentStrategy implements SegmentStrategy {
             return groups;
         }
 
+        // D2: 一次性批量向量化所有句子（1 次 HTTP 取代逐句/逐组 O(N^2) 调用）
+        String[] allTexts = sentences.stream().map(Sentence::getText).toArray(String[]::new);
+        float[][] sentenceVectors = vectorizer.vectorizeBatch(allTexts);
+
         SentenceGroup currentGroup = new SentenceGroup(sentences.get(0));
         groups.add(currentGroup);
+        float[] currentGroupVector = sentenceVectors[0].clone();
+        int groupSize = 1;
 
         for (int i = 1; i < sentences.size(); i++) {
             Sentence sentence = sentences.get(i);
+            float[] sentenceVector = sentenceVectors[i];
 
-            float[] currentVector = vectorizer.vectorize(currentGroup.getTheme());
-            float[] sentenceVector = vectorizer.vectorize(sentence.getText());
-
-            float similarity = cosineSimilarity(currentVector, sentenceVector);
+            float similarity = cosineSimilarity(currentGroupVector, sentenceVector);
             int similarityPercent = (int)(similarity * 100);
 
             if (similarityPercent >= similarityThreshold) {
                 currentGroup.addSentence(sentence);
+                // 组向量更新为组内句向量均值（不再调用 API）
+                for (int k = 0; k < currentGroupVector.length; k++) {
+                    currentGroupVector[k] = (currentGroupVector[k] * groupSize + sentenceVector[k]) / (groupSize + 1);
+                }
+                groupSize++;
                 log.debug("句子加入当前分组: similarity={}%, groupSize={}",
                         similarityPercent, currentGroup.getSentenceCount());
             } else {
                 currentGroup = new SentenceGroup(sentence);
                 groups.add(currentGroup);
+                currentGroupVector = sentenceVector.clone();
+                groupSize = 1;
                 log.debug("创建新分组: theme={}", currentGroup.getTheme());
             }
         }

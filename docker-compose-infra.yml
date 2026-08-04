@@ -113,6 +113,25 @@ services:
     networks:
       - docai-network
 
+  # Qdrant 向量数据库（可选：rag.vector.backend=qdrant 时启用）
+  # 本地单节点验证可用：docker run -p 6333:6333 -p 6334:6334 -v qdrant-data:/qdrant/storage qdrant/qdrant
+  qdrant:
+    image: qdrant/qdrant:latest
+    deploy:
+      mode: replicated
+      replicas: 1
+      placement:
+        max_replicas_per_node: 1
+      restart_policy:
+        condition: on-failure
+    volumes:
+      - qdrant-data:/qdrant/storage
+    networks:
+      - docai-network
+    ports:
+      - "6333:6333"   # REST
+      - "6334:6334"   # gRPC（Java 客户端使用）
+
 networks:
   docai-network:
     external: true
@@ -122,3 +141,5 @@ volumes:
   redis-data:
   minio-data:
   nacos-data:
+  qdrant-data:
+

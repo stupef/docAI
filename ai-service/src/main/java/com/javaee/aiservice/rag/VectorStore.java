@@ -1,308 +1,70 @@
 package com.javaee.aiservice.rag;
 
-import com.github.jelmerk.knn.DistanceFunctions;
-import com.github.jelmerk.knn.Item;
-import com.github.jelmerk.knn.SearchResult;
-import com.github.jelmerk.knn.hnsw.HnswIndex;
-import jakarta.annotation.PostConstruct;
-import org.slf4j.Logger;
-import org.slf4j.LoggerFactory;
-import org.springframework.beans.factory.annotation.Autowired;
-import org.springframework.beans.factory.annotation.Value;
-import org.springframework.data.redis.core.RedisTemplate;
-import org.springframework.data.redis.core.ScanOptions;
-import org.springframework.stereotype.Component;
-
-import java.io.Serializable;
-import java.nio.charset.StandardCharsets;
-import java.util.ArrayList;
-import java.util.Collections;
-import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
-import java.util.concurrent.locks.ReadWriteLock;
-import java.util.concurrent.locks.ReentrantReadWriteLock;
 
 /**
- * 向量存储
- * - 写入：Redis 持久化向量与元数据；HNSW in-memory 索引建立近邻图
- * - 检索：先在 HNSW 中做近似最近邻搜索，再用 Redis 中的元数据做过滤
- * - 启动：从 Redis 灌入历史向量重建索引
+ * 向量存储抽象接口。
+ * <p>
+ * 两种实现可互换，业务层（KnowledgeBase / KnowledgeIndexAgent / RagController）只依赖本接口，
+ * 通过 {@code rag.vector.backend} 配置切换，互不影响：
+ * <ul>
+ *   <li>{@code HnswRedisVectorStore}（默认）：HNSW 内存索引 + Redis 持久化</li>
+ *   <li>{@code QdrantVectorStore}：Qdrant 向量库，过滤下推根治"召回被筛空"隐患</li>
+ * </ul>
+ *
+ * 契约（实现类必须保证）：
+ * <ul>
+ *   <li>{@code store}：写入向量与元数据，元数据需随向量一起可回带（search 结果要包含）</li>
+ *   <li>{@code search}：返回 List，每项含 {@code id}(原始字符串)、{@code similarity}(余弦相似度)、以及全部元数据键值</li>
+ *   <li>{@code delete}：按原始字符串 id 删除</li>
+ * </ul>
  */
-@Component
-public class VectorStore {
-
-    private static final Logger log = LoggerFactory.getLogger(VectorStore.class);
-    private static final String VECTOR_PREFIX = "vector:";
-    private static final String METADATA_PREFIX = "metadata:";
-
-    @Autowired
-    private RedisTemplate<String, Object> redisTemplate;
-
-    @Value("${ai.vector.dimension:1536}")
-    private int defaultDimension;
-
-    @Value("${ai.vector.hnsw.m:16}")
-    private int hnswM;
-
-    @Value("${ai.vector.hnsw.ef-construction:200}")
-    private int hnswEfConstruction;
-
-    @Value("${ai.vector.hnsw.ef:128}")
-    private int hnswEf;
-
-    @Value("${ai.vector.hnsw.max-items:200000}")
-    private int hnswMaxItems;
-
-    private final ReadWriteLock lock = new ReentrantReadWriteLock();
-    private volatile HnswIndex<String, float[], FloatArrayItem, Float> index;
-    private volatile int dimension;
-
-    @PostConstruct
-    public void initialize() {
-        try {
-            warmupFromRedis();
-        } catch (Exception e) {
-            log.warn("HNSW 索引初始化失败，将在首次写入时构建: {}", e.getMessage());
-        }
-    }
-
-    /** 启动时从 Redis 重建 HNSW 索引。 */
-    private void warmupFromRedis() {
-        List<String> keys = scanKeys(VECTOR_PREFIX + "*", 1000);
-        if (keys == null || keys.isEmpty()) {
-            log.info("未发现已有向量数据，HNSW 索引延迟构建");
-            return;
-        }
-        for (String key : keys) {
-            String id = key.substring(VECTOR_PREFIX.length());
-            float[] vector = convertToFloatArray(redisTemplate.opsForValue().get(key));
-            if (vector == null) {
-                continue;
-            }
-            ensureIndex(vector.length);
-            try {
-                index.add(new FloatArrayItem(id, vector));
-            } catch (Exception e) {
-                log.warn("HNSW 索引重建时跳过向量 id={}: {}", id, e.getMessage());
-            }
-        }
-        log.info("HNSW 索引重建完成，载入 {} 个向量", index == null ? 0 : index.size());
-    }
+public interface VectorStore {
 
     /**
-     * 存储向量
+     * 存储向量与原文。
+     *
+     * @param id       原始字符串 id（可能是 chunkId，如 doc-x_seg_0）
+     * @param vector   向量（维度与 embedding 模型一致，默认 1536）
+     * @param content  原文文本（随向量持久化并在检索时回带；Qdrant 存入 payload，Redis 存入 segment:）
+     * @param metadata 元数据（随向量持久化并在检索时回带）
      */
-    public void store(String id, float[] vector, Map<String, Object> metadata) {
-        log.info("存储向量: id={}, dimension={}", id, vector.length);
-        try {
-            String vectorKey = VECTOR_PREFIX + id;
-            String metadataKey = METADATA_PREFIX + id;
+    void store(String id, float[] vector, String content, Map<String, Object> metadata);
 
-            List<Float> vectorList = new ArrayList<>(vector.length);
-            for (float v : vector) {
-                vectorList.add(v);
-            }
-            redisTemplate.opsForValue().set(vectorKey, vectorList);
-            redisTemplate.opsForHash().putAll(metadataKey, metadata);
+    /**
+     * 检索相似向量（不过滤）。
+     */
+    List<Map<String, Object>> search(float[] queryVector, int topK);
 
-            ensureIndex(vector.length);
-            lock.writeLock().lock();
-            try {
-                index.remove(id, 0L);
-                index.add(new FloatArrayItem(id, vector));
-            } finally {
-                lock.writeLock().unlock();
-            }
+    /**
+     * 检索相似向量（带过滤条件，精确相等匹配）。
+     */
+    List<Map<String, Object>> search(float[] queryVector, int topK, Map<String, Object> filters);
 
-            log.info("向量存储成功: id={}", id);
-        } catch (Exception e) {
-            log.error("向量存储失败", e);
-            throw new RuntimeException("向量存储失败: " + e.getMessage(), e);
-        }
-    }
+    /**
+     * 删除向量。
+     */
+    void delete(String id);
 
-    public List<Map<String, Object>> search(float[] queryVector, int topK) {
-        return search(queryVector, topK, Collections.emptyMap());
-    }
+    /**
+     * 按 id 取单 chunk 的原文（供检索结果回带 content / BM25 取 chunk 文本）。
+     * <ul>
+     *   <li>{@code HnswRedisVectorStore}：读 Redis {@code segment:}</li>
+     *   <li>{@code QdrantVectorStore}：从 payload 取 {@code content}</li>
+     * </ul>
+     */
+    String getContent(String id);
 
-    public List<Map<String, Object>> search(float[] queryVector, int topK, Map<String, Object> filters) {
-        log.info("搜索相似向量: topK={}", topK);
-
-        if (index == null || index.size() == 0) {
-            log.warn("HNSW 索引为空");
-            return Collections.emptyList();
-        }
-
-        try {
-            int candidateCount = Math.max(topK * 4, topK + 16);
-            List<SearchResult<FloatArrayItem, Float>> hits;
-            lock.readLock().lock();
-            try {
-                hits = index.findNearest(queryVector, candidateCount);
-            } finally {
-                lock.readLock().unlock();
-            }
-
-            List<Map<String, Object>> finalResults = new ArrayList<>();
-            for (SearchResult<FloatArrayItem, Float> hit : hits) {
-                if (finalResults.size() >= topK) {
-                    break;
-                }
-                String id = hit.item().id();
-                Map<String, Object> metadata = getMetadata(id);
-                if (!matchesFilters(metadata, filters)) {
-                    continue;
-                }
-                float similarity = 1.0f - hit.distance();
-                Map<String, Object> item = new HashMap<>();
-                item.put("id", id);
-                item.put("similarity", similarity);
-                item.putAll(metadata);
-                finalResults.add(item);
-            }
-
-            log.info("搜索完成，找到{}个结果", finalResults.size());
-            return finalResults;
-        } catch (Exception e) {
-            log.error("向量搜索失败", e);
-            throw new RuntimeException("向量搜索失败: " + e.getMessage(), e);
-        }
-    }
-
-    public void delete(String id) {
-        log.info("删除向量: id={}", id);
-        try {
-            redisTemplate.delete(VECTOR_PREFIX + id);
-            redisTemplate.delete(METADATA_PREFIX + id);
-            if (index != null) {
-                lock.writeLock().lock();
-                try {
-                    index.remove(id, 0L);
-                } finally {
-                    lock.writeLock().unlock();
-                }
-            }
-            log.info("向量删除成功: id={}", id);
-        } catch (Exception e) {
-            log.error("向量删除失败", e);
-            throw new RuntimeException("向量删除失败: " + e.getMessage(), e);
-        }
-    }
-
-    private void ensureIndex(int vectorDimension) {
-        if (index != null) {
-            return;
-        }
-        lock.writeLock().lock();
-        try {
-            if (index == null) {
-                int dim = vectorDimension > 0 ? vectorDimension : defaultDimension;
-                this.dimension = dim;
-                this.index = HnswIndex
-                        .newBuilder(dim, DistanceFunctions.FLOAT_COSINE_DISTANCE, hnswMaxItems)
-                        .withM(hnswM)
-                        .withEfConstruction(hnswEfConstruction)
-                        .withEf(hnswEf)
-                        .build();
-                log.info("HNSW 索引已创建: dimension={}, M={}, efConstruction={}, ef={}, maxItems={}",
-                        dim, hnswM, hnswEfConstruction, hnswEf, hnswMaxItems);
-            }
-        } finally {
-            lock.writeLock().unlock();
-        }
-    }
-
-    private Map<String, Object> getMetadata(String id) {
-        try {
-            Map<Object, Object> hash = redisTemplate.opsForHash().entries(METADATA_PREFIX + id);
-            Map<String, Object> metadata = new HashMap<>();
-            for (Map.Entry<Object, Object> entry : hash.entrySet()) {
-                metadata.put(entry.getKey().toString(), entry.getValue());
-            }
-            return metadata;
-        } catch (Exception e) {
-            log.warn("获取元数据失败", e);
-            return Collections.emptyMap();
-        }
-    }
-
-    private List<String> scanKeys(String pattern, int count) {
-        List<String> keys = new ArrayList<>();
-        ScanOptions options = ScanOptions.scanOptions().match(pattern).count(count).build();
-        try (var cursor = redisTemplate.getConnectionFactory().getConnection().scan(options)) {
-            while (cursor.hasNext()) {
-                keys.add(new String(cursor.next(), StandardCharsets.UTF_8));
-            }
-        }
-        return keys;
-    }
-
-    private boolean matchesFilters(Map<String, Object> metadata, Map<String, Object> filters) {
-        if (filters == null || filters.isEmpty()) {
-            return true;
-        }
-        for (Map.Entry<String, Object> filter : filters.entrySet()) {
-            Object expected = filter.getValue();
-            if (expected == null || expected.toString().isBlank()) {
-                continue;
-            }
-            Object actual = metadata.get(filter.getKey());
-            if (actual == null || !expected.toString().equals(actual.toString())) {
-                return false;
-            }
-        }
-        return true;
-    }
-
-    private float[] convertToFloatArray(Object obj) {
-        if (obj == null) {
-            return null;
-        }
-        if (obj instanceof float[]) {
-            return (float[]) obj;
-        }
-        if (obj instanceof List<?> list) {
-            float[] result = new float[list.size()];
-            for (int i = 0; i < list.size(); i++) {
-                Object item = list.get(i);
-                if (item instanceof Number number) {
-                    result[i] = number.floatValue();
-                } else {
-                    log.warn("无法转换向量元素: {}", item);
-                    result[i] = 0.0f;
-                }
-            }
-            return result;
-        }
-        log.warn("无法转换向量对象: {}", obj.getClass().getName());
-        return null;
-    }
-
-    /** HNSW 索引项实现。 */
-    private static final class FloatArrayItem implements Item<String, float[]>, Serializable {
-        private static final long serialVersionUID = 1L;
-        private final String id;
-        private final float[] vector;
-
-        FloatArrayItem(String id, float[] vector) {
-            this.id = id;
-            this.vector = vector;
-        }
-
-        @Override
-        public String id() {
-            return id;
-        }
-
-        @Override
-        public float[] vector() {
-            return vector;
-        }
-
-        @Override
-        public int dimensions() {
-            return vector.length;
-        }
-    }
+    /**
+     * 按过滤条件扫描全库 chunk 的原文 + 元数据。
+     * <p>
+     * 供 BM25 路在检索期一次性拉取全部 chunk 文本与多租户元数据打分，与具体后端解耦：
+     * <ul>
+     *   <li>{@code HnswRedisVectorStore}：扫 Redis {@code metadata:*} + {@code segment:}</li>
+     *   <li>{@code QdrantVectorStore}：用 Qdrant scroll（filter 下推）拉 payload（含 content）</li>
+     * </ul>
+     * 返回 chunk 级 id → 映射（内含全部元数据键 + 一个 {@code content} 键为原文）。
+     */
+    Map<String, Map<String, Object>> scanChunks(Map<String, Object> filters);
 }

@@ -84,16 +84,40 @@ public class DocumentVectorizer {
      * @return 向量列表
      */
     public float[][] vectorizeBatch(String[] texts) {
-        log.info("批量向量化，数量={}", texts.length);
+        log.info("批量向量化（真批量，一次请求），数量={}", texts.length);
 
+        final int batchSize = 25;
         try {
             float[][] result = new float[texts.length][];
-            for (int i = 0; i < texts.length; i++) {
-                result[i] = vectorize(texts[i]);
+            int offset = 0;
+            while (offset < texts.length) {
+                int end = Math.min(offset + batchSize, texts.length);
+                List<String> batch = Arrays.asList(texts).subList(offset, end);
+                TextEmbeddingParam param = TextEmbeddingParam.builder()
+                        .model(model)
+                        .apiKey(apiKey)
+                        .texts(batch)
+                        .build();
+                TextEmbedding textEmbedding = new TextEmbedding();
+                TextEmbeddingResult batchResult = textEmbedding.call(param);
+                var embeddings = batchResult.getOutput().getEmbeddings();
+                if (embeddings == null || embeddings.size() != batch.size()) {
+                    throw new RuntimeException("批量向量化返回数量不匹配: 期望=" + batch.size()
+                            + ", 实际=" + (embeddings == null ? 0 : embeddings.size()));
+                }
+                for (int i = 0; i < embeddings.size(); i++) {
+                    var embeddingList = embeddings.get(i).getEmbedding();
+                    float[] embedding = new float[embeddingList.size()];
+                    for (int j = 0; j < embeddingList.size(); j++) {
+                        embedding[j] = embeddingList.get(j).floatValue();
+                    }
+                    result[offset + i] = embedding;
+                }
+                offset = end;
             }
             log.info("批量向量化完成");
             return result;
-        } catch (Exception e) {
+        } catch (ApiException | NoApiKeyException e) {
             log.error("批量向量化失败", e);
             throw new RuntimeException("批量向量化失败: " + e.getMessage(), e);
         }

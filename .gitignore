@@ -35,5 +35,6 @@ build/
 ### Secrets & local config (do not upload) ###
 .env
 .workbuddy/
+.rag-eval/
 application-local.yml
 

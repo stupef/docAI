@@ -130,6 +130,20 @@
             <version>1.0.2</version>
         </dependency>
 
+        <!-- Qdrant 向量库客户端（rag.vector.backend=qdrant 时启用，替代 HNSW 内存索引） -->
+        <dependency>
+            <groupId>io.qdrant</groupId>
+            <artifactId>client</artifactId>
+            <version>1.10.0</version>
+        </dependency>
+
+        <!-- protobuf-java：qdrant client 经 grpc-protobuf 传递依赖 protobuf，但需显式挂到编译 classpath，否则报“无法访问 com.google.protobuf.*” -->
+        <dependency>
+            <groupId>com.google.protobuf</groupId>
+            <artifactId>protobuf-java</artifactId>
+            <version>3.24.0</version>
+        </dependency>
+
         <!-- Spring Boot Test -->
         <dependency>
             <groupId>org.springframework.boot</groupId>
@@ -140,6 +154,20 @@
 
     <build>
         <plugins>
+            <!-- 显式声明 Lombok 为注解处理器：强制 Maven 与 IDEA 都加载它，
+                 解决 @Data 类 getter/setter「找不到符号」问题（JDK17 + Lombok1.18.30） -->
+            <plugin>
+                <groupId>org.apache.maven.plugins</groupId>
+                <artifactId>maven-compiler-plugin</artifactId>
+                <configuration>
+                    <annotationProcessorPaths>
+                        <path>
+                            <groupId>org.projectlombok</groupId>
+                            <artifactId>lombok</artifactId>
+                        </path>
+                    </annotationProcessorPaths>
+                </configuration>
+            </plugin>
             <plugin>
                 <groupId>org.springframework.boot</groupId>
                 <artifactId>spring-boot-maven-plugin</artifactId>

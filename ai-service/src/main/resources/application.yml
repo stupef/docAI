@@ -150,10 +150,19 @@ springdoc:
   swagger-ui:
     path: /swagger-ui.html
 
-# RAG 检索配置（BM25 中文分词开关 + 召回深度）
+# RAG 检索配置（BM25 中文分词开关 + 召回深度 + 向量存储后端）
 rag:
   bm25:
     enabled: true
     segment-cjk: true
   recall:
     depth: 50
+  # 向量存储后端：redis=默认 HNSW 内存索引 + Redis；qdrant=Qdrant 向量库（过滤下推）
+  vector:
+    backend: redis
+
+# Qdrant 向量库连接（仅当 rag.vector.backend=qdrant 时生效）
+qdrant:
+  host: localhost
+  port: 6334
+  collection: docai
